@@ -1,0 +1,29 @@
+[package]
+name = "plotsimplify"
+version = "0.1.0"
+edition = "2021"
+description = "Error-bounded time series simplification (Ramer-Douglas-Peucker) for plotting, for Python (PyO3)"
+license = "MIT"
+repository = "https://github.com/f4hy/plotsimplify"
+
+[lib]
+name = "_plotsimplify"
+crate-type = ["cdylib", "rlib"]
+
+# `extension-module` links against libpython and breaks `cargo test` (no
+# libpython to link against outside a Python process). Gate it behind a
+# feature that's on by default (so `maturin develop`/`maturin build` just
+# work) but can be turned off for plain `cargo test --no-default-features`.
+[features]
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+# abi3-py311 builds against the stable ABI (matches requires-python in
+# pyproject.toml): one wheel per platform covers every Python >= 3.11.
+pyo3 = { version = "0.30", features = ["abi3-py311"] }
+numpy = "0.30"
+
+[profile.release]
+lto = true
+codegen-units = 1

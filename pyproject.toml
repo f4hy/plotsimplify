@@ -1,0 +1,42 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "plotsimplify"
+version = "0.1.0"
+description = "Rust-powered error-bounded time series simplification (Ramer-Douglas-Peucker) for plotting: keep only the points you can see"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = ["numpy>=1.26"]
+keywords = ["ramer-douglas-peucker", "rdp", "downsampling", "time series", "plotting", "line simplification", "decimation"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Scientific/Engineering :: Visualization",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.urls]
+Homepage = "https://github.com/f4hy/plotsimplify"
+Repository = "https://github.com/f4hy/plotsimplify"
+Issues = "https://github.com/f4hy/plotsimplify/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff==0.15.21",
+]
+
+[tool.maturin]
+module-name = "plotsimplify._plotsimplify"
+python-source = "python"
+
+[tool.ruff]
+line-length = 100

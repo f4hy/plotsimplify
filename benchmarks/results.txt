@@ -1,0 +1,11 @@
+SIMD path: avx512
+          N case                            plotsimplify  numpy ref  simplification    kept
+    100,000 vertical                              3.8 ms     126 ms                   7,334
+    100,000 perpendicular                         4.0 ms     115 ms           38 ms   1,871
+    100,000 vertical, max_points=1000             1.4 ms      20 ms                   1,000
+  1,000,000 vertical                             20.6 ms     107 ms                   2,386
+  1,000,000 perpendicular                        31.8 ms     327 ms          216 ms   1,072
+  1,000,000 vertical, max_points=1000            19.1 ms      93 ms                   1,000
+ 10,000,000 vertical                            254.6 ms    1664 ms                  14,117
+ 10,000,000 perpendicular                       345.2 ms    6560 ms         3125 ms   3,377
+ 10,000,000 vertical, max_points=1000           205.5 ms    1149 ms                   1,000
