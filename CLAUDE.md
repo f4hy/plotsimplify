@@ -9,17 +9,20 @@ crate); input handling lives in Python.
 - `src/core.rs`: PyO3-free kernels.
   - `scan`: one fused pass that ANDs finiteness into `valid` and returns
     sortedness, the first/last valid index and the y range.
-  - `rdp_keep`: max-heap, largest-error-first RDP over each valid run.
+  - `rdp_keep`: max-heap, largest-error-first RDP over each valid run. Takes
+    k >= 1 y series sharing x (bands) and scores each segment by its worst
+    error over all of them.
   - The 8-lane distance loops (`argmax_cross_*`, `argmax_seg_*`) are compiled
     again with AVX-512/AVX2 `target_feature` and picked at runtime
     (`PLOTSIMPLIFY_BASELINE=1` / `PLOTSIMPLIFY_NO_AVX512=1` force fallbacks).
   - Rust tests compare against textbook recursive RDP.
 - `src/lib.rs`: thin numpy-array bindings (`scan`, `rdp_keep`, `simd_level`),
-  GIL released.
+  GIL released. `rdp_keep` takes y as a C-contiguous `(k, n)` array.
 - `python/plotsimplify/__init__.py`: the `simplify()` API. It converts
   datetime64/int x to float offsets from the first valid point (exact in
   int64 first), handles pixel scaling and gap markers, and calls the kernel
-  via the module global `_rs`.
+  via the module global `_rs`. Multi-series y is ANDed into `valid` in NumPy,
+  then `scan` runs once per series for the combined y range.
 - `tests/reference_kernel.py`: pure-NumPy implementation of `scan`/`rdp_keep`.
   Tests monkeypatch `plotsimplify._rs` with it and require **bit-identical**
   results. A subprocess test does the same for the non-SIMD path.

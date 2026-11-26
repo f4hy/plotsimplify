@@ -24,7 +24,8 @@ class Simplified(NamedTuple):
     indices: np.ndarray
     """int64 indices into the original x/y, sorted."""
     max_error: float
-    """Worst distance from a dropped point to the drawn line, in `eps` units."""
+    """Worst distance from a dropped point to the drawn line, in `eps` units.
+    With several y series, the worst over all of them."""
 
 
 def simplify(
@@ -41,7 +42,12 @@ def simplify(
     """Pick the points of a time series needed to draw it within `eps` of the original.
 
     x: sorted timestamps. numpy datetime64, integer or float.
-    y: values. NaN marks a gap.
+    y: values. NaN marks a gap. Either one series, or several that share x and
+       are drawn together, such as the edges of a band (mu ± sigma, min/max):
+       a 2-D array of shape (len(x), k), or a list/tuple of k 1-D arrays.
+       Several series get one set of indices, chosen so that every series is
+       within `eps` of its own drawn line. A point is a gap if any series is
+       NaN there.
 
     With `width_px` and `height_px`, x and y are scaled to the plot's pixel size
     first, so `eps` is in pixels (0.5 means "every dropped point is within half
@@ -72,7 +78,14 @@ def simplify(
 
     xf, yf, valid = _prepare(x, y)
     n = len(xf)
-    sorted_ok, first, last, ymin, ymax = _rs.scan(xf, yf, valid)
+    if len(yf) > 1:
+        valid &= np.isfinite(yf).all(axis=0)
+    # With several series `valid` is already final, so every scan sees the same
+    # points and returns the same sortedness and first/last; only the y ranges differ.
+    scans = [_rs.scan(xf, yj, valid) for yj in yf]
+    sorted_ok, first, last, _, _ = scans[0]
+    ymin = min(r[3] for r in scans)
+    ymax = max(r[4] for r in scans)
     if not sorted_ok:
         raise ValueError("x must be sorted (non-decreasing)")
     if first < 0 or n <= 2:
@@ -107,12 +120,29 @@ def _gap_starts(valid):
     return ~valid & prev
 
 
+def _as_series(y):
+    """y as a C-contiguous float64 array of shape (k, n): one row per series."""
+    if isinstance(y, (list, tuple)) and len(y) > 0 and np.ndim(y[0]) >= 1:
+        cols = [np.asarray(c, dtype=np.float64) for c in y]
+        if any(c.ndim != 1 or len(c) != len(cols[0]) for c in cols):
+            raise ValueError("each series in y must be a 1-D array of the same length")
+        return np.stack(cols)
+    a = np.asarray(y, dtype=np.float64)
+    if a.ndim == 1:
+        return np.ascontiguousarray(a[None, :])
+    if a.ndim == 2:
+        if a.shape[1] == 0:
+            raise ValueError("y must hold at least one series")
+        return np.ascontiguousarray(a.T)
+    raise ValueError("y must be 1-D, 2-D of shape (len(x), k), or a sequence of 1-D arrays")
+
+
 def _prepare(x, y):
-    """Convert inputs to contiguous float64 x/y plus an initial validity mask (NaT -> invalid)."""
+    """Convert inputs to contiguous float64 x, (k, n) y and an initial validity mask (NaT -> invalid)."""
     x = np.asarray(x)
-    y = np.ascontiguousarray(y, dtype=np.float64)
-    if x.ndim != 1 or y.ndim != 1 or len(x) != len(y):
-        raise ValueError("x and y must be 1-D arrays of the same length")
+    y = _as_series(y)
+    if x.ndim != 1 or len(x) != y.shape[1]:
+        raise ValueError("x must be 1-D and y must have one value per x")
 
     if np.issubdtype(x.dtype, np.datetime64):
         valid = ~np.isnat(x)

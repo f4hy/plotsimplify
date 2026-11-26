@@ -273,6 +273,24 @@ def gappy_series():
     return x, y
 
 
+def gappy_band():
+    x, y = gappy_series()
+    rng = np.random.default_rng(0)
+    ys = np.column_stack([y - 3, y + rng.normal(0, 1, len(y)), y + 3])
+    ys[30_000:30_005, 2] = np.nan
+    return x, ys
+
+
+def simd_check_outputs():
+    """Results compared between the SIMD and forced-baseline builds."""
+    out = []
+    for x, y in (gappy_series(), gappy_band()):
+        out += [
+            simplify(x, y, metric=m, **kw) for m in ("vertical", "perpendicular") for kw in CASES
+        ]
+    return out
+
+
 @pytest.mark.parametrize("metric", ["vertical", "perpendicular"])
 @pytest.mark.parametrize("kw", CASES)
 def test_identical_to_numpy_reference(metric, kw, monkeypatch):
@@ -289,19 +307,118 @@ def test_baseline_simd_path_is_identical(tmp_path):
     script = (
         "import numpy as np, sys\n"
         "sys.path.insert(0, %r)\n"
-        "from tests.test_simplify import gappy_series, CASES\n"
-        "from plotsimplify import simplify, simd_level\n"
+        "from tests.test_simplify import simd_check_outputs\n"
+        "from plotsimplify import simd_level\n"
         "assert simd_level() == 'baseline', simd_level()\n"
-        "x, y = gappy_series()\n"
-        "out = [simplify(x, y, metric=m, **kw) for m in ('vertical', 'perpendicular') for kw in CASES]\n"
+        "out = simd_check_outputs()\n"
         "np.save(%r, np.array([r.max_error for r in out]))\n"
         "np.save(%r, np.concatenate([r.indices for r in out]))\n"
     ) % (str(Path(__file__).parent.parent), str(tmp_path / "err.npy"), str(tmp_path / "idx.npy"))
     env = dict(os.environ, PLOTSIMPLIFY_BASELINE="1")
     subprocess.run([sys.executable, "-c", script], check=True, env=env)
-    x, y = gappy_series()
-    out = [simplify(x, y, metric=m, **kw) for m in ("vertical", "perpendicular") for kw in CASES]
+    out = simd_check_outputs()
     np.testing.assert_array_equal(
         np.load(tmp_path / "idx.npy"), np.concatenate([r.indices for r in out])
     )
     np.testing.assert_array_equal(np.load(tmp_path / "err.npy"), [r.max_error for r in out])
+
+
+# ---------- several y series (bands) ----------
+
+
+def band(n, seed):
+    rng = np.random.default_rng(seed)
+    x = np.arange(n, dtype=np.float64)
+    mu = np.cumsum(rng.normal(0, 1, n))
+    s = 5 + np.abs(np.cumsum(rng.normal(0, 0.3, n)))
+    return x, mu - s, mu + s
+
+
+def test_band_union_of_separate_passes_breaks_bound_but_joint_does_not():
+    # The repro from issue #2: the union of per-series index sets can put a
+    # dropped point up to 2 * eps from the drawn line; the joint pass can't.
+    x, lo, hi = band(5000, 0)
+    k = np.union1d(simplify(x, lo, eps=0.5).indices, simplify(x, hi, eps=0.5).indices)
+    assert max(max_error(x, y, k, vert_dist) for y in (lo, hi)) > 0.5
+
+    r = simplify(x, np.column_stack([lo, hi]), eps=0.5)
+    assert max(max_error(x, y, r.indices, vert_dist) for y in (lo, hi)) <= 0.5
+    assert len(r.indices) <= len(k)
+
+
+@pytest.mark.parametrize("metric,dist", [("vertical", vert_dist), ("perpendicular", seg_dist)])
+@pytest.mark.parametrize("kw", [dict(eps=0.5), dict(eps=0.0, max_points=300)])
+def test_band_reported_error_is_worst_over_series(metric, dist, kw):
+    x, lo, hi = band(4000, 1)
+    mid = (lo + hi) / 2
+    r = simplify(x, [lo, mid, hi], metric=metric, **kw)
+    worst = max(max_error(x, y, r.indices, dist) for y in (lo, mid, hi))
+    assert r.max_error == pytest.approx(worst, abs=1e-9)
+    if "max_points" in kw:
+        assert len(r.indices) == kw["max_points"]
+    else:
+        assert worst <= kw["eps"] + 1e-9
+
+
+def test_band_error_bound_in_pixels():
+    x, lo, hi = band(3000, 2)
+    w, h, eps = 800, 300, 0.5
+    for metric, dist in [("vertical", vert_dist), ("perpendicular", seg_dist)]:
+        idx = simplify(x, (lo, hi), eps=eps, width_px=w, height_px=h, metric=metric).indices
+        # The default y range spans all series.
+        y0, y1 = lo.min(), hi.max()
+        px = (x - x[0]) * w / (x[-1] - x[0])
+        for y in (lo, hi):
+            assert max_error(px, (y - y0) * h / (y1 - y0), idx, dist) <= eps + 1e-9
+
+
+def test_band_input_forms_agree():
+    x, lo, hi = band(2000, 3)
+    a = simplify(x, np.column_stack([lo, hi]))
+    for y in ([lo, hi], (lo, hi), [lo.tolist(), hi.tolist()], np.asfortranarray(np.c_[lo, hi])):
+        b = simplify(x, y)
+        np.testing.assert_array_equal(a.indices, b.indices)
+        assert a.max_error == b.max_error
+
+
+def test_one_column_matches_1d():
+    x, y = random_series(3000, 4)
+    for metric in ("vertical", "perpendicular"):
+        for kw in CASES:
+            a = simplify(x, y, metric=metric, **kw)
+            for yy in (y[:, None], [y], [y, y]):
+                b = simplify(x, yy, metric=metric, **kw)
+                np.testing.assert_array_equal(a.indices, b.indices)
+                assert a.max_error == b.max_error
+
+
+def test_band_gaps_are_the_union():
+    x = np.arange(20.0)
+    lo, hi = np.zeros(20), np.ones(20)
+    lo[5:8] = np.nan
+    hi[7:9] = np.nan
+    hi[15] = np.nan
+    assert simplify(x, [lo, hi]).indices.tolist() == [0, 4, 5, 9, 14, 15, 16, 19]
+
+
+def test_band_bad_args():
+    x = np.arange(5.0)
+    with pytest.raises(ValueError, match="same length"):
+        simplify(x, [np.zeros(5), np.zeros(4)])
+    with pytest.raises(ValueError, match="one value per x"):
+        simplify(x, np.zeros((4, 2)))
+    with pytest.raises(ValueError, match="at least one"):
+        simplify(x, np.zeros((5, 0)))
+    with pytest.raises(ValueError):
+        simplify(x, np.zeros((5, 2, 1)))
+
+
+@pytest.mark.parametrize("metric", ["vertical", "perpendicular"])
+@pytest.mark.parametrize("kw", CASES)
+def test_band_identical_to_numpy_reference(metric, kw, monkeypatch):
+    x, ys = gappy_band()
+    got = simplify(x, ys, metric=metric, **kw)
+    monkeypatch.setattr(plotsimplify, "_rs", reference_kernel)
+    ref = simplify(x, ys, metric=metric, **kw)
+    np.testing.assert_array_equal(got.indices, ref.indices)
+    assert got.max_error == ref.max_error

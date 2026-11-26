@@ -61,8 +61,22 @@ def _farthest(x, y, s, e, vertical):
     return float(np.sqrt(max(d[i], 0.0))), s + 1 + i
 
 
+def _farthest_multi(x, ys, s, e, vertical):
+    """`_farthest` over each row of ys: the largest distance, ties to the lowest
+    point index, then the first series."""
+    dmax, imax = _farthest(x, ys[0], s, e, vertical)
+    for y in ys[1:]:
+        d, k = _farthest(x, y, s, e, vertical)
+        if d > dmax or (d == dmax and k < imax):
+            dmax, imax = d, k
+    return dmax, imax
+
+
 def rdp_keep(x, y, valid, eps, vertical, max_points, keep):
     """Mark points to keep (in place); return the max error of the result.
+
+    y has shape (k, n): one or more series sharing x. Each segment is scored
+    by its worst distance over all series.
 
     Every gap's first point and every run's endpoints are kept; then segments
     are split at their farthest point, largest distance first, until the
@@ -90,7 +104,7 @@ def rdp_keep(x, y, valid, eps, vertical, max_points, keep):
     heap = []
     for s0, e0 in zip(run_starts.tolist(), run_ends.tolist()):
         if e0 - s0 >= 2:
-            d, k = _farthest(x, y, s0, e0, vertical)
+            d, k = _farthest_multi(x, y, s0, e0, vertical)
             heap.append((-d, s0, e0, k))
     heapq.heapify(heap)
 
@@ -102,9 +116,9 @@ def rdp_keep(x, y, valid, eps, vertical, max_points, keep):
         keep[k] = True
         count += 1
         if k - s >= 2:
-            d1, k1 = _farthest(x, y, s, k, vertical)
+            d1, k1 = _farthest_multi(x, y, s, k, vertical)
             heapq.heappush(heap, (-d1, s, k, k1))
         if e - k >= 2:
-            d2, k2 = _farthest(x, y, k, e, vertical)
+            d2, k2 = _farthest_multi(x, y, k, e, vertical)
             heapq.heappush(heap, (-d2, k, e, k2))
     return 0.0

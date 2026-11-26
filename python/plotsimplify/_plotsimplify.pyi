@@ -9,7 +9,7 @@ def scan(
 ) -> tuple[bool, int, int, float, float]: ...
 def rdp_keep(
     x: npt.NDArray[np.float64],
-    y: npt.NDArray[np.float64],
+    y: npt.NDArray[np.float64],  # (k, n), C-contiguous
     valid: npt.NDArray[np.bool_],
     eps: float,
     vertical: bool,
