@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "plotsimplify"
-version = "0.1.0"
+version = "0.2.0"
 description = "Rust-powered error-bounded time series simplification (Ramer-Douglas-Peucker) for plotting: keep only the points you can see"
 readme = "README.md"
 requires-python = ">=3.11"
