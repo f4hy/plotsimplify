@@ -5,6 +5,9 @@
 //! - `rdp_keep`: RDP over each run of valid points, splitting segments
 //!   largest-error-first (a max-heap) so `max_points` gives the best greedy
 //!   budget. Marks kept points and gap markers; returns the max error left.
+//!   Takes one or more y series sharing x (e.g. the edges of a band) and
+//!   scores each segment by its worst error over all of them, so a single
+//!   set of kept points bounds every series.
 //!
 //! The distance loops are written as 8 independent lanes so LLVM vectorises
 //! them, and are compiled again for AVX-512/AVX2 and picked at runtime. FMA
@@ -254,6 +257,22 @@ fn farthest(x: &[f64], y: &[f64], s: usize, e: usize, vertical: bool) -> (f64, u
     (d.max(0.0).sqrt(), s + 1 + k)
 }
 
+/// `farthest` over several y series sharing x: the largest distance across
+/// series and its point. Ties go to the lowest point index, then the first series.
+#[inline(always)]
+fn farthest_multi(x: &[f64], ys: &[&[f64]], s: usize, e: usize, vertical: bool) -> (f64, usize) {
+    // One call site, so `farthest` and its SIMD loops are inlined only once.
+    let (mut dmax, mut imax) = (f64::NEG_INFINITY, usize::MAX);
+    for y in ys {
+        let (d, k) = farthest(x, y, s, e, vertical);
+        if d > dmax || (d == dmax && k < imax) {
+            dmax = d;
+            imax = k;
+        }
+    }
+    (dmax, imax)
+}
+
 // ---------------------------------------------------------------- heap
 
 /// Max-heap of segments keyed on the distance of their farthest point.
@@ -322,9 +341,11 @@ pub fn simd_level() -> &'static str {
 
 // ---------------------------------------------------------------- kernels
 
+/// `ys` holds one or more y series, each the length of `x`; `valid` must
+/// already be false wherever any of them is non-finite (see `scan`).
 pub fn rdp_keep(
     x: &[f64],
-    y: &[f64],
+    ys: &[&[f64]],
     valid: &[bool],
     eps: f64,
     vertical: bool,
@@ -332,6 +353,7 @@ pub fn rdp_keep(
     keep: &mut [bool],
 ) -> f64 {
     let n = x.len();
+    assert!(!ys.is_empty() && ys.iter().all(|y| y.len() == n));
     let mut heap = Heap(Vec::new());
     let mut count: i64 = 0;
 
@@ -357,7 +379,7 @@ pub fn rdp_keep(
             count += 1;
         }
         if e0 - s0 >= 2 {
-            let (d, k) = farthest(x, y, s0, e0, vertical);
+            let (d, k) = farthest_multi(x, ys, s0, e0, vertical);
             heap.push(Seg { d, s: s0, e: e0, k });
         }
     }
@@ -370,11 +392,11 @@ pub fn rdp_keep(
         keep[k] = true;
         count += 1;
         if k - s >= 2 {
-            let (d, k1) = farthest(x, y, s, k, vertical);
+            let (d, k1) = farthest_multi(x, ys, s, k, vertical);
             heap.push(Seg { d, s, e: k, k: k1 });
         }
         if e - k >= 2 {
-            let (d, k2) = farthest(x, y, k, e, vertical);
+            let (d, k2) = farthest_multi(x, ys, k, e, vertical);
             heap.push(Seg { d, s: k, e, k: k2 });
         }
     }
@@ -554,7 +576,7 @@ mod tests {
         let mut valid = vec![true; x.len()];
         scan(x, y, &mut valid);
         let mut keep = vec![false; x.len()];
-        let err = rdp_keep(x, y, &valid, eps, vertical, max_points, &mut keep);
+        let err = rdp_keep(x, &[y], &valid, eps, vertical, max_points, &mut keep);
         let idx = keep
             .iter()
             .enumerate()
@@ -652,5 +674,70 @@ mod tests {
         y[15] = f64::NAN;
         let (idx, _) = run(&x, &y, 0.5, true, 0);
         assert_eq!(idx, [0, 4, 5, 8, 14, 15, 16, 19]);
+    }
+
+    fn run_multi(
+        x: &[f64],
+        ys: &[&[f64]],
+        eps: f64,
+        vertical: bool,
+        max_points: i64,
+    ) -> (Vec<usize>, f64) {
+        let valid = vec![true; x.len()];
+        let mut keep = vec![false; x.len()];
+        let err = rdp_keep(x, ys, &valid, eps, vertical, max_points, &mut keep);
+        let idx = (0..x.len()).filter(|&i| keep[i]).collect();
+        (idx, err)
+    }
+
+    fn worst(x: &[f64], y: &[f64], idx: &[usize], vertical: bool) -> f64 {
+        let mut w: f64 = 0.0;
+        for p in idx.windows(2) {
+            for k in p[0] + 1..p[1] {
+                w = w.max(if vertical {
+                    vert(x, y, k, p[0], p[1])
+                } else {
+                    seg(x, y, k, p[0], p[1])
+                });
+            }
+        }
+        w
+    }
+
+    #[test]
+    fn one_series_in_multi_is_unchanged() {
+        let (x, y) = series(3000, 4);
+        for vertical in [true, false] {
+            for (eps, budget) in [(0.5, 0), (0.0, 200)] {
+                assert_eq!(
+                    run_multi(&x, &[&y, &y], eps, vertical, budget),
+                    run(&x, &y, eps, vertical, budget)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn band_bounds_every_series() {
+        let (x, a) = series(5000, 5);
+        let (_, b) = series(5000, 6);
+        let lo: Vec<f64> = a.iter().zip(&b).map(|(a, b)| a - 3.0 - b.abs()).collect();
+        let hi: Vec<f64> = a.iter().zip(&b).map(|(a, b)| a + 3.0 + b.abs()).collect();
+        let ys: [&[f64]; 3] = [&lo, &a, &hi];
+        for vertical in [true, false] {
+            for (eps, budget) in [(0.5, 0), (0.0, 300)] {
+                let (idx, err) = run_multi(&x, &ys, eps, vertical, budget);
+                let w = ys
+                    .iter()
+                    .map(|y| worst(&x, y, &idx, vertical))
+                    .fold(0.0, f64::max);
+                if budget == 0 {
+                    assert!(w <= eps + 1e-9, "{w}");
+                } else {
+                    assert_eq!(idx.len(), budget as usize);
+                }
+                assert!((w - err).abs() <= 1e-9 * w.max(1.0), "{w} vs {err}");
+            }
+        }
     }
 }

@@ -67,6 +67,13 @@ Prebuilt `abi3` wheels (Linux/macOS/Windows, x86-64 and arm64, Python
 - **`max_points`.** Segments are split largest-error-first, so a budget
   gives you the most important points in one pass, and `max_error` reports
   the error you actually got.
+- **Bands.** Pass several y series that share x, such as `mu ± sigma` or
+  a min/max envelope, as a `(len(x), k)` array or a list of arrays:
+  `simplify(t, [lo, hi])`. You get one set of indices, and every series is
+  within `eps` of its drawn line. Simplifying each edge separately and
+  taking the union of the indices doesn't give that: the extra points split
+  the other edge's segments, and its error can reach `2 * eps`. The joint
+  pass also keeps fewer points. A point is a gap if any series is NaN there.
 - **Gaps.** Points with NaN `y` or NaT `x` are dropped, except the first
   point of each gap. It's kept so the plot breaks the line instead of
   joining across the gap.
