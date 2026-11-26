@@ -125,6 +125,8 @@ def _prepare(x, y):
 
     # Subtract the first timestamp while still in int64: ns epochs (~1.7e18)
     # don't fit float64's 53-bit mantissa, but offsets from the start do.
+    if len(xi) == 0:
+        return np.zeros(0, dtype=np.float64), y, valid
     first = int(np.argmax(valid)) if valid.any() else 0
     xf = (xi - xi[first]).astype(np.float64)
     return xf, y, valid

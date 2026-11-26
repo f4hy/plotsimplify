@@ -158,6 +158,41 @@ def test_all_nan_and_tiny_inputs():
     assert simplify(np.arange(5.0), np.full(5, np.nan)).indices.tolist() == [0]
 
 
+EMPTY_X = [
+    np.array([], dtype=np.float64),
+    np.array([], dtype=np.int64),
+    np.array([], dtype=np.uint32),
+    np.array([], dtype="datetime64[ns]"),
+]
+EMPTY_KW = [
+    {},
+    dict(width_px=800, height_px=300),
+    dict(max_points=10),
+    dict(width_px=800, height_px=300, max_points=10, y_range=(0.0, 1.0)),
+]
+
+
+@pytest.mark.parametrize("metric", ["vertical", "perpendicular"])
+@pytest.mark.parametrize("kw", EMPTY_KW)
+@pytest.mark.parametrize("x", EMPTY_X, ids=lambda a: str(a.dtype))
+def test_empty_input(x, kw, metric):
+    r = simplify(x, np.array([]), metric=metric, **kw)
+    assert r.indices.dtype == np.int64 and len(r.indices) == 0
+    assert r.max_error == 0.0
+
+
+@pytest.mark.parametrize("metric", ["vertical", "perpendicular"])
+@pytest.mark.parametrize("kw", EMPTY_KW)
+@pytest.mark.parametrize("n", [1, 2, 5, 50])
+def test_all_invalid_input(n, kw, metric):
+    # All-NaN y, and all-NaT x: just the one gap marker.
+    t = np.full(n, np.datetime64("NaT", "ns"))
+    for x, y in [(np.arange(n), np.full(n, np.nan)), (t, np.zeros(n))]:
+        r = simplify(x, y, metric=metric, **kw)
+        assert r.indices.tolist() == [0]
+        assert r.max_error == 0.0
+
+
 def test_datetime64_matches_seconds():
     x, y = random_series(2000, 3)
     t = np.datetime64("2026-01-01T00:00:00", "ns") + (x * 1e9).astype("timedelta64[ns]")
