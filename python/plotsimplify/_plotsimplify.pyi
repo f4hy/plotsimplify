@@ -10,7 +10,7 @@ def scan(
 def rdp_keep(
     x: npt.NDArray[np.float64],
     y: npt.NDArray[np.float64],  # (k, n), C-contiguous
-    valid: npt.NDArray[np.bool_],
+    valid: npt.NDArray[np.bool_],  # (k, n), C-contiguous: one mask per series
     eps: float,
     vertical: bool,
     max_points: int,

@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 import plotsimplify
-from plotsimplify import simplify
+from plotsimplify import simplify, simplify_many
 
 from . import reference_kernel
 
@@ -281,13 +281,18 @@ def gappy_band():
     return x, ys
 
 
+MANY_CASES = [dict(kw, gaps=g) for kw in CASES for g in ("per_series", "shared")] + [
+    dict(eps=0.2, width_px=900, height_px=300, y_range=[None, (-50.0, 50.0), None]),
+]
+
+
 def simd_check_outputs():
     """Results compared between the SIMD and forced-baseline builds."""
-    out = []
-    for x, y in (gappy_series(), gappy_band()):
-        out += [
-            simplify(x, y, metric=m, **kw) for m in ("vertical", "perpendicular") for kw in CASES
-        ]
+    metrics = ("vertical", "perpendicular")
+    x, y = gappy_series()
+    out = [simplify(x, y, metric=m, **kw) for m in metrics for kw in CASES]
+    x, ys = gappy_band()
+    out += [simplify_many(x, ys, metric=m, **kw) for m in metrics for kw in MANY_CASES]
     return out
 
 
@@ -323,7 +328,7 @@ def test_baseline_simd_path_is_identical(tmp_path):
     np.testing.assert_array_equal(np.load(tmp_path / "err.npy"), [r.max_error for r in out])
 
 
-# ---------- several y series (bands) ----------
+# ---------- several y series: simplify_many ----------
 
 
 def band(n, seed):
@@ -334,25 +339,42 @@ def band(n, seed):
     return x, mu - s, mu + s
 
 
-def test_band_union_of_separate_passes_breaks_bound_but_joint_does_not():
+def test_union_of_separate_passes_breaks_bound_but_joint_does_not():
     # The repro from issue #2: the union of per-series index sets can put a
     # dropped point up to 2 * eps from the drawn line; the joint pass can't.
     x, lo, hi = band(5000, 0)
     k = np.union1d(simplify(x, lo, eps=0.5).indices, simplify(x, hi, eps=0.5).indices)
     assert max(max_error(x, y, k, vert_dist) for y in (lo, hi)) > 0.5
 
-    r = simplify(x, np.column_stack([lo, hi]), eps=0.5)
+    r = simplify_many(x, [lo, hi], eps=0.5)
     assert max(max_error(x, y, r.indices, vert_dist) for y in (lo, hi)) <= 0.5
     assert len(r.indices) <= len(k)
 
 
+def gappy_trio(n=4000, seed=1):
+    x, lo, hi = band(n, seed)
+    mid = (lo + hi) / 2
+    lo[300:340] = np.nan
+    mid[2000:3500] = np.nan
+    hi[3999] = np.nan
+    return x, [lo, mid, hi]
+
+
+def shared_mask(ys):
+    bad = ~np.all([np.isfinite(y) for y in ys], axis=0)
+    return [np.where(bad, np.nan, y) for y in ys]
+
+
+@pytest.mark.parametrize("gaps", ["per_series", "shared"])
 @pytest.mark.parametrize("metric,dist", [("vertical", vert_dist), ("perpendicular", seg_dist)])
 @pytest.mark.parametrize("kw", [dict(eps=0.5), dict(eps=0.0, max_points=300)])
-def test_band_reported_error_is_worst_over_series(metric, dist, kw):
-    x, lo, hi = band(4000, 1)
-    mid = (lo + hi) / 2
-    r = simplify(x, [lo, mid, hi], metric=metric, **kw)
-    worst = max(max_error(x, y, r.indices, dist) for y in (lo, mid, hi))
+def test_bound_and_reported_error_over_all_series(gaps, metric, dist, kw):
+    x, ys = gappy_trio()
+    r = simplify_many(x, ys, metric=metric, gaps=gaps, **kw)
+    # `max_error` checks each series over its own valid runs (and that their
+    # endpoints were kept); with shared gaps, a run ends where any series breaks.
+    drawn = ys if gaps == "per_series" else shared_mask(ys)
+    worst = max(max_error(x, y, r.indices, dist) for y in drawn)
     assert r.max_error == pytest.approx(worst, abs=1e-9)
     if "max_points" in kw:
         assert len(r.indices) == kw["max_points"]
@@ -360,11 +382,38 @@ def test_band_reported_error_is_worst_over_series(metric, dist, kw):
         assert worst <= kw["eps"] + 1e-9
 
 
-def test_band_error_bound_in_pixels():
+def test_per_series_gaps_dont_drop_other_series_data():
+    x = np.arange(1000.0)
+    a = np.sin(x / 50)
+    b = a + 1
+    b[100:900] = np.nan
+    r = simplify_many(x, [a, b], eps=0.01)
+    # `a` is bounded over its whole range, just as on its own.
+    assert max_error(x, a, r.indices, vert_dist) <= 0.01
+    assert np.count_nonzero((r.indices > 100) & (r.indices < 900)) > 10
+    # With shared gaps, a's points under b's gap are gone: only the marker is left.
+    shared = simplify_many(x, [a, b], eps=0.01, gaps="shared").indices
+    assert not np.any((shared > 100) & (shared < 900))
+
+
+def test_gap_markers():
+    x = np.arange(20.0)
+    lo, hi = np.zeros(20), np.ones(20)
+    lo[5:8] = np.nan
+    hi[7:9] = np.nan
+    hi[15] = np.nan
+    # Each series' run ends and gap starts.
+    assert simplify_many(x, [lo, hi]).indices.tolist() == [0, 4, 5, 6, 7, 8, 9, 14, 15, 16, 19]
+    # One combined set of gaps.
+    shared = simplify_many(x, [lo, hi], gaps="shared").indices.tolist()
+    assert shared == [0, 4, 5, 9, 14, 15, 16, 19]
+
+
+def test_error_bound_in_pixels_shared_axis():
     x, lo, hi = band(3000, 2)
     w, h, eps = 800, 300, 0.5
     for metric, dist in [("vertical", vert_dist), ("perpendicular", seg_dist)]:
-        idx = simplify(x, (lo, hi), eps=eps, width_px=w, height_px=h, metric=metric).indices
+        idx = simplify_many(x, [lo, hi], eps=eps, width_px=w, height_px=h, metric=metric).indices
         # The default y range spans all series.
         y0, y1 = lo.min(), hi.max()
         px = (x - x[0]) * w / (x[-1] - x[0])
@@ -372,53 +421,112 @@ def test_band_error_bound_in_pixels():
             assert max_error(px, (y - y0) * h / (y1 - y0), idx, dist) <= eps + 1e-9
 
 
-def test_band_input_forms_agree():
+def test_error_bound_in_pixels_axis_per_series():
+    # Twin axes: temperature in degrees and pressure in pascals.
+    x, a = random_series(3000, 12)
+    _, b = random_series(3000, 13)
+    b = 101_325 + 1000 * b
+    w, h, eps = 800, 300, 0.5
+    px = (x - x[0]) * w / (x[-1] - x[0])
+    for y_range in ([None, None], [(a.min() - 5, a.max() + 5), None]):
+        for metric, dist in [("vertical", vert_dist), ("perpendicular", seg_dist)]:
+            r = simplify_many(
+                x, [a, b], eps=eps, width_px=w, height_px=h, metric=metric, y_range=y_range
+            )
+            worst = 0.0
+            for y, rng in zip((a, b), y_range):
+                y0, y1 = rng or (y.min(), y.max())
+                worst = max(worst, max_error(px, (y - y0) * h / (y1 - y0), r.indices, dist))
+            assert worst <= eps + 1e-9
+            assert r.max_error == pytest.approx(worst, abs=1e-9)
+    # On one shared axis, the pascal series' range squashes `a`, so drawn on its
+    # own axis it is many pixels off.
+    shared = simplify_many(x, [a, b], eps=eps, width_px=w, height_px=h).indices
+    assert max_error(px, (a - a.min()) * h / (a.max() - a.min()), shared, vert_dist) > 5
+
+
+def test_input_forms_agree():
     x, lo, hi = band(2000, 3)
-    a = simplify(x, np.column_stack([lo, hi]))
-    for y in ([lo, hi], (lo, hi), [lo.tolist(), hi.tolist()], np.asfortranarray(np.c_[lo, hi])):
-        b = simplify(x, y)
+    a = simplify_many(x, np.column_stack([lo, hi]))
+    for ys in (
+        [lo, hi],
+        (lo, hi),
+        [lo.tolist(), hi.tolist()],
+        {"lo": lo, "hi": hi},
+        np.asfortranarray(np.c_[lo, hi]),
+        np.c_[lo, np.zeros_like(lo), hi][:, ::2],
+    ):
+        b = simplify_many(x, ys)
         np.testing.assert_array_equal(a.indices, b.indices)
         assert a.max_error == b.max_error
 
 
-def test_one_column_matches_1d():
-    x, y = random_series(3000, 4)
+@pytest.mark.parametrize("gaps", ["per_series", "shared"])
+def test_one_series_matches_simplify(gaps):
+    x, y = gappy_series()
     for metric in ("vertical", "perpendicular"):
         for kw in CASES:
             a = simplify(x, y, metric=metric, **kw)
-            for yy in (y[:, None], [y], [y, y]):
-                b = simplify(x, yy, metric=metric, **kw)
+            for ys in (y[:, None], [y], [y, y]):
+                b = simplify_many(x, ys, metric=metric, gaps=gaps, **kw)
                 np.testing.assert_array_equal(a.indices, b.indices)
                 assert a.max_error == b.max_error
 
 
-def test_band_gaps_are_the_union():
-    x = np.arange(20.0)
-    lo, hi = np.zeros(20), np.ones(20)
-    lo[5:8] = np.nan
-    hi[7:9] = np.nan
-    hi[15] = np.nan
-    assert simplify(x, [lo, hi]).indices.tolist() == [0, 4, 5, 9, 14, 15, 16, 19]
+@pytest.mark.parametrize("gaps", ["per_series", "shared"])
+@pytest.mark.parametrize("kw", [{}, dict(width_px=800, height_px=300, max_points=5)])
+def test_many_empty_and_all_invalid(gaps, kw):
+    e = simplify_many(np.array([], dtype="datetime64[ns]"), np.zeros((0, 2)), gaps=gaps, **kw)
+    assert e.indices.tolist() == [] and e.max_error == 0.0
+    nan = np.full(5, np.nan)
+    r = simplify_many(np.arange(5), [nan, nan], gaps=gaps, **kw)
+    assert r.indices.tolist() == [0] and r.max_error == 0.0
 
 
-def test_band_bad_args():
+def test_per_series_x_must_be_sorted_across_series():
+    # Each series alone is sorted, but together they go back in time.
+    x = np.array([0.0, 2.0, 1.0, 3.0])
+    a = np.array([0.0, 1.0, np.nan, 2.0])
+    b = np.array([0.0, np.nan, 1.0, 2.0])
+    simplify(x, a)
+    simplify(x, b)
+    with pytest.raises(ValueError, match="sorted"):
+        simplify_many(x, [a, b])
+    simplify_many(x, [a, b], gaps="shared")  # index 1 and 2 are gaps in both
+
+
+def test_many_bad_args():
     x = np.arange(5.0)
-    with pytest.raises(ValueError, match="same length"):
-        simplify(x, [np.zeros(5), np.zeros(4)])
     with pytest.raises(ValueError, match="one value per x"):
-        simplify(x, np.zeros((4, 2)))
+        simplify_many(x, [np.zeros(5), np.zeros(4)])
+    with pytest.raises(ValueError, match="pass ys.T"):
+        simplify_many(x, np.zeros((2, 5)))
+    with pytest.raises(ValueError, match=r"shape \(len\(x\), k\)"):
+        simplify_many(x, np.zeros((4, 2)))
     with pytest.raises(ValueError, match="at least one"):
-        simplify(x, np.zeros((5, 0)))
-    with pytest.raises(ValueError):
-        simplify(x, np.zeros((5, 2, 1)))
+        simplify_many(x, np.zeros((5, 0)))
+    with pytest.raises(ValueError, match="at least one"):
+        simplify_many(x, [])
+    with pytest.raises(ValueError, match="use simplify"):
+        simplify_many(x, [0.0, 1.0, 2.0, 3.0, 4.0])
+    with pytest.raises(ValueError, match="2-D"):
+        simplify_many(x, np.zeros(5))
+    with pytest.raises(ValueError, match="gaps"):
+        simplify_many(x, [x], gaps="any")
+    with pytest.raises(ValueError, match="y_range"):
+        simplify_many(x, [x, x], y_range=[(0, 1)], width_px=10, height_px=10)
+    with pytest.raises(ValueError, match="use simplify_many"):
+        simplify(x, np.zeros((5, 2)))
+    with pytest.raises(ValueError, match="y_range"):
+        simplify(x, x, y_range=[(0, 1), (0, 1)], width_px=10, height_px=10)
 
 
 @pytest.mark.parametrize("metric", ["vertical", "perpendicular"])
-@pytest.mark.parametrize("kw", CASES)
-def test_band_identical_to_numpy_reference(metric, kw, monkeypatch):
+@pytest.mark.parametrize("kw", MANY_CASES)
+def test_many_identical_to_numpy_reference(metric, kw, monkeypatch):
     x, ys = gappy_band()
-    got = simplify(x, ys, metric=metric, **kw)
+    got = simplify_many(x, ys, metric=metric, **kw)
     monkeypatch.setattr(plotsimplify, "_rs", reference_kernel)
-    ref = simplify(x, ys, metric=metric, **kw)
+    ref = simplify_many(x, ys, metric=metric, **kw)
     np.testing.assert_array_equal(got.indices, ref.indices)
     assert got.max_error == ref.max_error

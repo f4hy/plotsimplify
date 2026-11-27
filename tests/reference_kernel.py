@@ -61,51 +61,55 @@ def _farthest(x, y, s, e, vertical):
     return float(np.sqrt(max(d[i], 0.0))), s + 1 + i
 
 
-def _farthest_multi(x, ys, s, e, vertical):
-    """`_farthest` over each row of ys: the largest distance, ties to the lowest
-    point index, then the first series."""
-    dmax, imax = _farthest(x, ys[0], s, e, vertical)
-    for y in ys[1:]:
+def _farthest_multi(x, ys, valid, s, e, vertical):
+    """`_farthest` over the rows of ys valid at both s and e: the largest distance,
+    ties to the lowest point index, then the first series. None if no row is."""
+    best = None
+    for y, v in zip(ys, valid):
+        if not (v[s] and v[e]):
+            continue
         d, k = _farthest(x, y, s, e, vertical)
-        if d > dmax or (d == dmax and k < imax):
-            dmax, imax = d, k
-    return dmax, imax
+        if best is None or d > best[0] or (d == best[0] and k < best[1]):
+            best = (d, k)
+    return best
+
+
+def _structural(v):
+    """Run starts, run ends and the first point of each gap of one mask."""
+    n = len(v)
+    prev = np.concatenate(([False], v[:-1]))
+    nxt = np.concatenate((v[1:], [False]))
+    first = np.zeros(n, dtype=np.bool_)
+    first[:1] = True
+    return np.where(v, ~prev | ~nxt, first | prev)
 
 
 def rdp_keep(x, y, valid, eps, vertical, max_points, keep):
     """Mark points to keep (in place); return the max error of the result.
 
-    y has shape (k, n): one or more series sharing x. Each segment is scored
-    by its worst distance over all series.
-
-    Every gap's first point and every run's endpoints are kept; then segments
-    are split at their farthest point, largest distance first, until the
-    largest remaining distance is <= eps or `max_points` (if > 0) is reached.
+    y and valid have shape (k, n): one or more series sharing x, each with its
+    own validity mask. Every series' run endpoints and the first point of each
+    of its gaps are kept. Between consecutive kept points a series is then
+    valid throughout or not drawn at all, so each segment is scored over the
+    series valid at both its ends. Segments are split at their farthest point,
+    largest distance first, until the largest remaining distance is <= eps or
+    `max_points` (if > 0) is reached.
     """
     n = len(x)
     if n == 0:
         return 0.0
 
-    # Runs of valid points and the first index of each gap, found with array ops.
-    v = valid.astype(np.int8)
-    edges = np.diff(np.concatenate(([0], v, [0])))
-    run_starts = np.flatnonzero(edges == 1)
-    run_ends = np.flatnonzero(edges == -1) - 1
-    gap_starts = np.flatnonzero(edges[:-1] == -1)  # index right after a run ends
-    if not valid[0]:
-        gap_starts = np.concatenate(([0], gap_starts))
-    gap_starts = gap_starts[gap_starts < n]
-
-    keep[gap_starts] = True
-    keep[run_starts] = True
-    keep[run_ends] = True
-    count = int(np.count_nonzero(keep))
+    for v in valid:
+        keep |= _structural(v)
+    kept = np.flatnonzero(keep).tolist()
+    count = len(kept)
 
     heap = []
-    for s0, e0 in zip(run_starts.tolist(), run_ends.tolist()):
-        if e0 - s0 >= 2:
-            d, k = _farthest_multi(x, y, s0, e0, vertical)
-            heap.append((-d, s0, e0, k))
+    for a, b in zip(kept, kept[1:]):
+        if b - a >= 2:
+            r = _farthest_multi(x, y, valid, a, b, vertical)
+            if r is not None:
+                heap.append((-r[0], a, b, r[1]))
     heapq.heapify(heap)
 
     while heap:
@@ -115,10 +119,9 @@ def rdp_keep(x, y, valid, eps, vertical, max_points, keep):
         _, s, e, k = heapq.heappop(heap)
         keep[k] = True
         count += 1
-        if k - s >= 2:
-            d1, k1 = _farthest_multi(x, y, s, k, vertical)
-            heapq.heappush(heap, (-d1, s, k, k1))
-        if e - k >= 2:
-            d2, k2 = _farthest_multi(x, y, k, e, vertical)
-            heapq.heappush(heap, (-d2, k, e, k2))
+        for a, b in ((s, k), (k, e)):
+            if b - a >= 2:
+                r = _farthest_multi(x, y, valid, a, b, vertical)
+                if r is not None:
+                    heapq.heappush(heap, (-r[0], a, b, r[1]))
     return 0.0

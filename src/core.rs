@@ -5,9 +5,9 @@
 //! - `rdp_keep`: RDP over each run of valid points, splitting segments
 //!   largest-error-first (a max-heap) so `max_points` gives the best greedy
 //!   budget. Marks kept points and gap markers; returns the max error left.
-//!   Takes one or more y series sharing x (e.g. the edges of a band) and
-//!   scores each segment by its worst error over all of them, so a single
-//!   set of kept points bounds every series.
+//!   Takes one or more y series sharing x, each with its own validity mask,
+//!   and scores each segment by its worst error over the series drawn across
+//!   it, so a single set of kept points bounds every series.
 //!
 //! The distance loops are written as 8 independent lanes so LLVM vectorises
 //! them, and are compiled again for AVX-512/AVX2 and picked at runtime. FMA
@@ -257,20 +257,32 @@ fn farthest(x: &[f64], y: &[f64], s: usize, e: usize, vertical: bool) -> (f64, u
     (d.max(0.0).sqrt(), s + 1 + k)
 }
 
-/// `farthest` over several y series sharing x: the largest distance across
-/// series and its point. Ties go to the lowest point index, then the first series.
+/// `farthest` over the series drawn across segment s-e: those valid at both
+/// ends, which (see `rdp_keep`) are valid at every point in between. Returns the
+/// largest distance and its point, or None if no series is drawn there. Ties go
+/// to the lowest point index, then the first series.
 #[inline(always)]
-fn farthest_multi(x: &[f64], ys: &[&[f64]], s: usize, e: usize, vertical: bool) -> (f64, usize) {
+fn farthest_multi(
+    x: &[f64],
+    ys: &[&[f64]],
+    valids: &[&[bool]],
+    s: usize,
+    e: usize,
+    vertical: bool,
+) -> Option<(f64, usize)> {
     // One call site, so `farthest` and its SIMD loops are inlined only once.
-    let (mut dmax, mut imax) = (f64::NEG_INFINITY, usize::MAX);
-    for y in ys {
-        let (d, k) = farthest(x, y, s, e, vertical);
-        if d > dmax || (d == dmax && k < imax) {
-            dmax = d;
-            imax = k;
+    let mut best: Option<(f64, usize)> = None;
+    for (y, v) in ys.iter().zip(valids) {
+        if !(v[s] && v[e]) {
+            continue;
         }
+        let (d, k) = farthest(x, y, s, e, vertical);
+        best = match best {
+            Some((dmax, imax)) if !(d > dmax || (d == dmax && k < imax)) => best,
+            _ => Some((d, k)),
+        };
     }
-    (dmax, imax)
+    best
 }
 
 // ---------------------------------------------------------------- heap
@@ -341,47 +353,57 @@ pub fn simd_level() -> &'static str {
 
 // ---------------------------------------------------------------- kernels
 
-/// `ys` holds one or more y series, each the length of `x`; `valid` must
-/// already be false wherever any of them is non-finite (see `scan`).
+/// RDP over one or more y series sharing `x`. `valids[j]` marks where series j
+/// is drawn (finite, see `scan`); it is false in j's gaps.
+///
+/// First every series' structural points are kept: the start and end of each
+/// of its valid runs and the first point of each of its gaps. Between two
+/// consecutive kept points a series is then either valid throughout or has no
+/// valid point strictly inside (its gap would have put a kept point there), and
+/// splitting a segment keeps that true. So a segment is scored only over the
+/// series valid at both of its ends. With one series this is plain RDP over
+/// each valid run.
 pub fn rdp_keep(
     x: &[f64],
     ys: &[&[f64]],
-    valid: &[bool],
+    valids: &[&[bool]],
     eps: f64,
     vertical: bool,
     max_points: i64,
     keep: &mut [bool],
 ) -> f64 {
     let n = x.len();
-    assert!(!ys.is_empty() && ys.iter().all(|y| y.len() == n));
+    assert!(!ys.is_empty() && ys.len() == valids.len());
+    assert!(ys.iter().all(|y| y.len() == n) && valids.iter().all(|v| v.len() == n));
     let mut heap = Heap(Vec::new());
     let mut count: i64 = 0;
 
-    let mut i = 0;
-    while i < n {
-        if !valid[i] {
-            keep[i] = true;
-            count += 1;
-            while i < n && !valid[i] {
-                i += 1;
+    // Run starts and ends, and the first point of each gap. Point 0 is always
+    // one or the other. Interior points are done branch-free over three shifted
+    // slices, so the pass vectorises.
+    if n > 0 {
+        keep[0] = true;
+    }
+    if n >= 2 {
+        for v in valids {
+            keep[n - 1] |= v[n - 1] || v[n - 2];
+            let (prev, cur, next) = (&v[..n - 2], &v[1..n - 1], &v[2..]);
+            for (((kp, &p), &c), &nx) in keep[1..n - 1].iter_mut().zip(prev).zip(cur).zip(next) {
+                *kp |= (c & !(p & nx)) | (!c & p);
             }
-            continue;
         }
-        let s0 = i;
-        while i < n && valid[i] {
-            i += 1;
-        }
-        let e0 = i - 1;
-        keep[s0] = true;
+    }
+    let mut prev: Option<usize> = None;
+    for i in (0..n).filter(|&i| keep[i]) {
         count += 1;
-        if e0 != s0 {
-            keep[e0] = true;
-            count += 1;
+        if let Some(a) = prev {
+            if i - a >= 2 {
+                if let Some((d, k)) = farthest_multi(x, ys, valids, a, i, vertical) {
+                    heap.push(Seg { d, s: a, e: i, k });
+                }
+            }
         }
-        if e0 - s0 >= 2 {
-            let (d, k) = farthest_multi(x, ys, s0, e0, vertical);
-            heap.push(Seg { d, s: s0, e: e0, k });
-        }
+        prev = Some(i);
     }
 
     while let Some(top) = heap.0.first() {
@@ -391,13 +413,16 @@ pub fn rdp_keep(
         let Seg { s, e, k, .. } = heap.pop();
         keep[k] = true;
         count += 1;
+        // Both halves are drawn by the same series as the whole, so neither is None.
         if k - s >= 2 {
-            let (d, k1) = farthest_multi(x, ys, s, k, vertical);
-            heap.push(Seg { d, s, e: k, k: k1 });
+            if let Some((d, k1)) = farthest_multi(x, ys, valids, s, k, vertical) {
+                heap.push(Seg { d, s, e: k, k: k1 });
+            }
         }
         if e - k >= 2 {
-            let (d, k2) = farthest_multi(x, ys, k, e, vertical);
-            heap.push(Seg { d, s: k, e, k: k2 });
+            if let Some((d, k2)) = farthest_multi(x, ys, valids, k, e, vertical) {
+                heap.push(Seg { d, s: k, e, k: k2 });
+            }
         }
     }
     0.0
@@ -576,7 +601,7 @@ mod tests {
         let mut valid = vec![true; x.len()];
         scan(x, y, &mut valid);
         let mut keep = vec![false; x.len()];
-        let err = rdp_keep(x, &[y], &valid, eps, vertical, max_points, &mut keep);
+        let err = rdp_keep(x, &[y], &[&valid], eps, vertical, max_points, &mut keep);
         let idx = keep
             .iter()
             .enumerate()
@@ -676,6 +701,7 @@ mod tests {
         assert_eq!(idx, [0, 4, 5, 8, 14, 15, 16, 19]);
     }
 
+    /// Each series' validity comes from its own finiteness (per-series gaps).
     fn run_multi(
         x: &[f64],
         ys: &[&[f64]],
@@ -683,9 +709,17 @@ mod tests {
         vertical: bool,
         max_points: i64,
     ) -> (Vec<usize>, f64) {
-        let valid = vec![true; x.len()];
+        let valids: Vec<Vec<bool>> = ys
+            .iter()
+            .map(|y| {
+                let mut v = vec![true; x.len()];
+                scan(x, y, &mut v);
+                v
+            })
+            .collect();
+        let valids: Vec<&[bool]> = valids.iter().map(|v| v.as_slice()).collect();
         let mut keep = vec![false; x.len()];
-        let err = rdp_keep(x, ys, &valid, eps, vertical, max_points, &mut keep);
+        let err = rdp_keep(x, ys, &valids, eps, vertical, max_points, &mut keep);
         let idx = (0..x.len()).filter(|&i| keep[i]).collect();
         (idx, err)
     }
@@ -737,6 +771,52 @@ mod tests {
                     assert_eq!(idx.len(), budget as usize);
                 }
                 assert!((w - err).abs() <= 1e-9 * w.max(1.0), "{w} vs {err}");
+            }
+        }
+    }
+
+    /// Worst error of one series over its own valid runs, which must start and end on kept points.
+    fn worst_runs(x: &[f64], y: &[f64], keep: &[usize], vertical: bool) -> f64 {
+        let mut w: f64 = 0.0;
+        let mut i = 0;
+        while i < y.len() {
+            if !y[i].is_finite() {
+                i += 1;
+                continue;
+            }
+            let s0 = i;
+            while i < y.len() && y[i].is_finite() {
+                i += 1;
+            }
+            let ks: Vec<usize> = keep.iter().copied().filter(|&k| k >= s0 && k < i).collect();
+            assert_eq!((ks[0], ks[ks.len() - 1]), (s0, i - 1), "run ends kept");
+            w = w.max(worst(x, y, &ks, vertical));
+        }
+        w
+    }
+
+    #[test]
+    fn per_series_gaps_bound_each_series_on_its_own_runs() {
+        let (x, a) = series(4000, 7);
+        let (_, mut b) = series(4000, 8);
+        let mut c = a.iter().map(|v| v * 2.0).collect::<Vec<_>>();
+        for v in &mut b[500..3500] {
+            *v = f64::NAN;
+        }
+        c[100] = f64::NAN;
+        c[3999] = f64::NAN;
+        let ys: [&[f64]; 3] = [&a, &b, &c];
+        for vertical in [true, false] {
+            let (idx, err) = run_multi(&x, &ys, 0.5, vertical, 0);
+            let w = ys
+                .iter()
+                .map(|y| worst_runs(&x, y, &idx, vertical))
+                .fold(0.0, f64::max);
+            assert!(w <= 0.5 + 1e-9, "{w}");
+            assert!((w - err).abs() <= 1e-9 * w.max(1.0), "{w} vs {err}");
+            // Gap markers of every series are kept.
+            for k in [100, 500, 3999] {
+                assert!(idx.contains(&k), "{k}");
             }
         }
     }
