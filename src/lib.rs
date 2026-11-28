@@ -11,6 +11,15 @@ fn check_len(a: usize, b: usize) -> PyResult<()> {
     Ok(())
 }
 
+/// The k rows of a flat C-contiguous (k, n) array.
+fn rows<T>(a: &[T], k: usize, n: usize) -> Vec<&[T]> {
+    if n == 0 {
+        vec![&a[..0]; k]
+    } else {
+        a.chunks_exact(n).collect()
+    }
+}
+
 /// scan(x, y, valid) -> (sorted_ok, first, last, ymin, ymax); updates `valid` in place.
 #[pyfunction]
 fn scan<'py>(
@@ -28,35 +37,34 @@ fn scan<'py>(
 
 /// rdp_keep(x, y, valid, eps, vertical, max_points, keep) -> max_error; updates `keep` in place.
 ///
-/// `y` is a C-contiguous (k, n) array: k >= 1 series sharing `x`.
+/// `y` and `valid` are C-contiguous (k, n) arrays: k >= 1 series sharing `x`,
+/// each with its own validity mask.
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 fn rdp_keep<'py>(
     py: Python<'py>,
     x: PyReadonlyArray1<'py, f64>,
     y: PyReadonlyArray2<'py, f64>,
-    valid: PyReadonlyArray1<'py, bool>,
+    valid: PyReadonlyArray2<'py, bool>,
     eps: f64,
     vertical: bool,
     max_points: i64,
     mut keep: PyReadwriteArray1<'py, bool>,
 ) -> PyResult<f64> {
     let (k, n) = (y.shape()[0], y.shape()[1]);
-    let (x, y, valid) = (x.as_slice()?, y.as_slice()?, valid.as_slice()?);
-    let keep = keep.as_slice_mut()?;
     if k == 0 {
         return Err(PyValueError::new_err("y must hold at least one series"));
     }
+    if valid.shape() != y.shape() {
+        return Err(PyValueError::new_err("valid must have the same shape as y"));
+    }
+    let (x, y, valid) = (x.as_slice()?, y.as_slice()?, valid.as_slice()?);
+    let keep = keep.as_slice_mut()?;
     check_len(x.len(), n)?;
-    check_len(x.len(), valid.len())?;
     check_len(x.len(), keep.len())?;
-    let ys: Vec<&[f64]> = if n == 0 {
-        vec![&[]; k]
-    } else {
-        y.chunks_exact(n).collect()
-    };
+    let (ys, valids) = (rows(y, k, n), rows(valid, k, n));
     // Release the GIL: other Python threads keep running while we crunch.
-    Ok(py.detach(|| core::rdp_keep(x, &ys, valid, eps, vertical, max_points, keep)))
+    Ok(py.detach(|| core::rdp_keep(x, &ys, &valids, eps, vertical, max_points, keep)))
 }
 
 /// Which SIMD path the distance loops use on this CPU: "avx512", "avx2" or "baseline".
